@@ -56,8 +56,25 @@ class Settings:
 
         os.makedirs(self.config_folder, exist_ok=True)
 
-        cookies_json_file = os.path.join(self.config_folder, "cookies.txt")
-        self.cookies_file = cookies_json_file if os.path.exists(cookies_json_file) else None
+        # 不在初始化时把 cookies_file 状态写死;改用 property 每次访问时探测文件。
+        # 这样替换 / 新增 / 删除 cookies.txt 之后无需重启进程,下一次入队的下载任务即可读到新内容。
+        self._cookies_file_path = os.path.join(self.config_folder, "cookies.txt")
+        self._cookies_file_mtime = None
+
+    @property
+    def cookies_file(self):
+        path = self._cookies_file_path
+        if not path or not os.path.exists(path):
+            self._cookies_file_mtime = None
+            return None
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return path
+        if mtime != self._cookies_file_mtime:
+            self._cookies_file_mtime = mtime
+            logging.info(f"Detected cookies.txt update: {path}")
+        return path
 
     def _load_settings(self):
         if not os.path.exists(self.settings_file_path):

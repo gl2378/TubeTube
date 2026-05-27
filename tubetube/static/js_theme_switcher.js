@@ -7,7 +7,7 @@ const storedMode = localStorage.getItem('mode');
 if (storedMode === 'auto') {
     setTheme(getSystemTheme());
 } else {
-    setTheme(storedTheme || 'light');
+    setTheme(storedTheme || 'dark');
 }
 
 function setTheme(theme) {
@@ -20,9 +20,10 @@ function setTheme(theme) {
         body.classList.remove('bg-body-tertiary');
     }
 
-    dayButton.classList.toggle('active', theme === 'light' && localStorage.getItem('mode') === 'manual');
-    autoButton.classList.toggle('active', localStorage.getItem('mode') === 'auto');
-    nightButton.classList.toggle('active', theme === 'dark' && localStorage.getItem('mode') === 'manual');
+    const mode = localStorage.getItem('mode') || 'manual';
+    dayButton.classList.toggle('active', theme === 'light' && mode === 'manual');
+    autoButton.classList.toggle('active', mode === 'auto');
+    nightButton.classList.toggle('active', theme === 'dark' && mode === 'manual');
 }
 
 function getSystemTheme() {

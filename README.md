@@ -131,6 +131,8 @@ environment:
 
 ## 常用命令
 
+### yt-dlp
+
 ```bash
 
 # 查看分辨率
@@ -146,4 +148,11 @@ yt-dlp --cookies ./cookies.txt \
        --write-subs \
        --sub-langs zh-TW \
        --sub-format srt <url>
+```
+
+### 同步代码
+
+```git
+git fetch --all
+git merge upstream/main
 ```

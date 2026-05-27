@@ -6,6 +6,7 @@ import platform
 import threading
 import random
 import shutil
+import collections
 import yaml
 import yt_dlp
 from settings import DownloadCancelledException
@@ -36,6 +37,13 @@ class DownloadManager:
         self.all_items = {}
         self.lock = threading.Lock()
         self.stop_signals = {}
+        # 全局网络下载并发控制:同一时间只允许 1 条任务进入"网络下载"阶段。
+        # 后处理(ffmpeg merge / embed / metadata 等)不受此锁限制,由 worker 池天然并发。
+        # 用 FIFO 票据队列 + Condition 实现"按 download_id 入队顺序"的公平锁,
+        # 避免普通 Semaphore 在多 worker 轮询时被 OS 调度打乱顺序。
+        self._net_cv = threading.Condition()
+        self._net_busy = False
+        self._net_waiters = collections.deque()  # FIFO 票据,元素为 download_id
 
         os_system = platform.system()
         logging.info(f"OS: {os_system}")
@@ -395,9 +403,69 @@ class DownloadManager:
                 if self.download_queue.empty():
                     logging.info(f"Queue is empty.")
 
+    def _acquire_net_slot(self, download_id, stop_event):
+        """按 FIFO 顺序公平获取网络下载槽位;期间响应 cancel。返回 True=拿到槽位,False=被取消。"""
+        with self._net_cv:
+            self._net_waiters.append(download_id)
+        try:
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    return False
+                with self._net_cv:
+                    # 队首并且锁空闲时才能拿到槽位
+                    if not self._net_busy and self._net_waiters and self._net_waiters[0] == download_id:
+                        self._net_busy = True
+                        self._net_waiters.popleft()
+                        return True
+                    # 否则等通知,带超时以便定期检查 cancel
+                    self._net_cv.wait(timeout=0.5)
+        except BaseException:
+            # 异常路径下,把自己从等待队列里清掉,避免死等
+            with self._net_cv:
+                try:
+                    self._net_waiters.remove(download_id)
+                except ValueError:
+                    pass
+                self._net_cv.notify_all()
+            raise
+
+    def _release_net_slot(self):
+        with self._net_cv:
+            if self._net_busy:
+                self._net_busy = False
+                self._net_cv.notify_all()
+
     def _download_item(self, download_id):
         item = self.all_items[download_id]
+
+        # ---- 阶段 1:等待网络下载槽位(全局只允许 1 路,FIFO 公平) ----
+        item["status"] = "Waiting"
+        item["progress"] = "Queued"
+        self.socketio.emit("update_download_item", {"item": item})
+
+        stop_event = self.stop_signals.get(download_id)
+        if not self._acquire_net_slot(download_id, stop_event):
+            item["status"] = "Cancelled"
+            item["progress"] = "Cancelled"
+            self.socketio.emit("update_download_item", {"item": item})
+            return
+
+        network_lock_released = {"value": False}
+
+        def _release_network_lock(reason):
+            # 幂等释放,可被 progress_hook / postprocessor_hook / finally 任意一处触发
+            if network_lock_released["value"]:
+                return
+            network_lock_released["value"] = True
+            self._release_net_slot()
+            logging.info(f"[net-slot] released by {reason} for download_id={download_id}")
+
+        # ---- 阶段 2:进入下载 ----
         item["status"] = "In Progress"
+        # 重置 progress,避免前端继续显示等待时设置的 "Queued"。
+        # 同时清掉首次进度上报的标记,确保第一次 downloading 回调一定会 emit。
+        item["progress"] = "0%"
+        item.pop("_first_progress_emitted", None)
         self.socketio.emit("update_download_item", {"item": item})
 
         download_settings = item.get("download_settings")
@@ -418,7 +486,8 @@ class DownloadManager:
             "ignore_no_formats_error": True,
             "noplaylist": True,
             "outtmpl": f"{item_title}.%(ext)s",
-            "progress_hooks": [lambda d: self._progress_hook(d, download_id)],
+            "progress_hooks": [lambda d: self._progress_hook(d, download_id, _release_network_lock)],
+            "postprocessor_hooks": [lambda d: self._postprocessor_hook(d, download_id, _release_network_lock)],
             "ffmpeg_location": self.ffmpeg_location,
             "writethumbnail": True,
             "quiet": not self.verbose_ytdlp,
@@ -431,6 +500,19 @@ class DownloadManager:
             "no_overwrites": True,
             "verbose": self.verbose_ytdlp,
             "no_mtime": True,
+            # 网络抖动 / 代理 / SSL 偶发错误下的鲁棒性配置
+            "retries": 30,                  # 整段下载的最大重试
+            "fragment_retries": 30,         # 分片下载的最大重试(直播/HLS/DASH)
+            "extractor_retries": 5,         # 解析阶段的重试
+            "file_access_retries": 5,
+            "retry_sleep_functions": {      # 指数退避,封顶 30s
+                "http": lambda n: min(2 ** n, 30),
+                "fragment": lambda n: min(2 ** n, 30),
+                "extractor": lambda n: min(2 ** n, 30),
+            },
+            "socket_timeout": 30,           # 单次 socket 操作超时
+            "http_chunk_size": 10 * 1024 * 1024,  # 10MiB 分块,降低长连接被中断的概率
+            "continuedl": True,             # 断点续传
             "format_sort": [f"lang:{self.preferred_language}", f"acodec:{self.preferred_audio_codec}", "quality", "size", f"vcodec:{self.preferred_video_codec}", f"vext:{self.preferred_video_ext}"],
         }
         if self.proxy:
@@ -463,6 +545,7 @@ class DownloadManager:
 
         ydl_opts["postprocessors"] = post_processors
 
+        ydl = None
         try:
             logging.info(f'Starting {threading.current_thread().name} Download: {item.get("title")}')
             ydl = yt_dlp.YoutubeDL(ydl_opts)
@@ -483,10 +566,13 @@ class DownloadManager:
             logging.error(f'Error downloading: {item.get("title")} - {str(e)}')
 
         finally:
+            # 兜底:即便 progress_hook / postprocessor_hook 都没触发(比如直接异常退出),也不能泄漏锁。
+            _release_network_lock("finally")
             self.socketio.emit("update_download_item", {"item": item})
-            ydl.close()
+            if ydl is not None:
+                ydl.close()
 
-    def _progress_hook(self, d, download_id):
+    def _progress_hook(self, d, download_id, release_network_lock=None):
         if self.stop_signals[download_id].is_set():
             raise DownloadCancelledException("Cancelled")
 
@@ -495,8 +581,12 @@ class DownloadManager:
                 item = self.all_items[download_id]
                 self._log_video_format_if_needed(item, d)
 
-                if random.randint(1, 10) != 1:
+                # 首次进度回调强制 emit,绕过 1/10 降频。
+                # 避免前端 progress 列长时间停留在 "Queued"/"0%"。
+                first_emit = not item.get("_first_progress_emitted")
+                if not first_emit and random.randint(1, 10) != 1:
                     return
+                item["_first_progress_emitted"] = True
 
                 live = d.get("info_dict", {}).get("is_live", False)
                 if live:
@@ -517,7 +607,37 @@ class DownloadManager:
                 item = self.all_items[download_id]
                 item["progress"] = "Downloaded"
                 item["status"] = "Processing"
+                # 标记"真实媒体流已下载完成":progress_hook 的 finished 只对实际 format 流触发,
+                # 不会对 before_dl 的 postprocessor(如 FFmpegThumbnailsConvertor)触发。
+                # 这是判断"网络阶段是否结束"的可靠信号,网络锁的释放必须等这个标记置位。
+                item["_streams_completed"] = True
                 logging.info(f'Download finished: {item.get("title")} - processing now')
+                self.socketio.emit("update_download_item", {"item": item})
+
+    def _postprocessor_hook(self, d, download_id, release_network_lock=None):
+        # 关键:before_dl 的后处理器(FFmpegThumbnailsConvertor / FFmpegSubtitlesConvertor / TrimDescriptionPP)
+        # 在真正下载开始之前就会触发 started,如果在这里直接释放锁会让"串行"破功。
+        # 用 _streams_completed 作为门闸:只有 progress_hook 的 finished 触发过,才意味着
+        # 网络下载真的结束了,此时第一个 after_dl 的 PP started 即可释放槽位让下一条进入下载。
+        status = d.get("status")
+        pp_name = d.get("postprocessor") or "PostProcessing"
+
+        if status == "started" and release_network_lock is not None:
+            with self.lock:
+                item = self.all_items.get(download_id)
+                streams_done = bool(item and item.get("_streams_completed"))
+            if streams_done:
+                release_network_lock(f"postprocessor:{pp_name}")
+
+        # 同步前端:让用户看到"处理中:xxx";同样用 _streams_completed 过滤掉 before_dl 阶段
+        if status in ("started", "processing"):
+            with self.lock:
+                item = self.all_items.get(download_id)
+                if not item:
+                    return
+                if not item.get("_streams_completed"):
+                    return
+                item["status"] = f"Processing ({pp_name})"
                 self.socketio.emit("update_download_item", {"item": item})
 
     def _log_video_format_if_needed(self, item, d):
