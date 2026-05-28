@@ -27,7 +27,7 @@ DEFAULT_APP_CONFIG = {
     "ALLOW_AUTO_SUBS": True,
     "SUBTITLE_FORMAT": "vtt",
     "SUBTITLE_LANGUAGES": "zh-Hant",
-    "THREAD_COUNT": 4,
+    "THREAD_COUNT": 16,
 }
 
 
@@ -116,7 +116,7 @@ class DownloadManager:
         if self.embed_subs:
             self.subtitle_pps.append({"key": "FFmpegEmbedSubtitle", "already_have_subtitle": self.write_subs})
 
-        self.thread_count = self._get_int("THREAD_COUNT", 4)
+        self.thread_count = self._get_int("THREAD_COUNT", 16)
         logging.info(f"Thread Count: {self.thread_count}")
 
         for i in range(self.thread_count):
@@ -360,8 +360,10 @@ class DownloadManager:
                 "id": download_id,
                 "title": yt_info_dict.get("title"),
                 "url": url,
-                "status": "Pending",
-                "progress": "0%",
+                # 初始状态直接标 Waiting,与 worker 接管后等网络槽位的状态一致;
+                # 这样前端看到的"还没开始下载"统一为 Waiting,避免出现短暂的 Pending → Waiting 切换。
+                "status": "Waiting",
+                "progress": "Queued",
                 "folder_name": item_info.get("folder_name"),
                 "download_settings": item_info.get("download_settings"),
                 "audio_only": item_info.get("audio_only"),
@@ -407,6 +409,7 @@ class DownloadManager:
         """按 FIFO 顺序公平获取网络下载槽位;期间响应 cancel。返回 True=拿到槽位,False=被取消。"""
         with self._net_cv:
             self._net_waiters.append(download_id)
+        acquired = False
         try:
             while True:
                 if stop_event is not None and stop_event.is_set():
@@ -416,18 +419,20 @@ class DownloadManager:
                     if not self._net_busy and self._net_waiters and self._net_waiters[0] == download_id:
                         self._net_busy = True
                         self._net_waiters.popleft()
+                        acquired = True
                         return True
                     # 否则等通知,带超时以便定期检查 cancel
                     self._net_cv.wait(timeout=0.5)
-        except BaseException:
-            # 异常路径下,把自己从等待队列里清掉,避免死等
-            with self._net_cv:
-                try:
-                    self._net_waiters.remove(download_id)
-                except ValueError:
-                    pass
-                self._net_cv.notify_all()
-            raise
+        finally:
+            # 任何未拿到槽位的退出路径(被取消、异常)都必须把自己从等待队列里清掉,
+            # 否则该 id 会永远卡在队首,阻塞后续所有新任务进入下载。
+            if not acquired:
+                with self._net_cv:
+                    try:
+                        self._net_waiters.remove(download_id)
+                    except ValueError:
+                        pass
+                    self._net_cv.notify_all()
 
     def _release_net_slot(self):
         with self._net_cv:
@@ -702,3 +707,17 @@ class DownloadManager:
                     if item_id in self.stop_signals:
                         del self.stop_signals[item_id]
                     self.socketio.emit("remove_download_item", {"id": item_id})
+
+        # 兜底清扫:被删除的 id 不应再留在网络槽位等待队列里;
+        # 同时 notify_all 唤醒可能正在等待这些 id 的 worker,让它们立刻退出。
+        with self._net_cv:
+            removed = False
+            for item_id in item_ids:
+                while True:
+                    try:
+                        self._net_waiters.remove(item_id)
+                        removed = True
+                    except ValueError:
+                        break
+            if removed:
+                self._net_cv.notify_all()

@@ -78,7 +78,7 @@ removeSelected.addEventListener('click', function () {
         const id = parseInt(row.getAttribute('data-id'), 10);
         const status = row.querySelector('.status').textContent.trim();
 
-        if (status === 'In Progress' || status === 'Downloading' || status === 'Pending') {
+        if (status === 'In Progress' || status === 'Downloading' || status === 'Waiting') {
             cancelIds.push(id);
         } else {
             removeIds.push(id);

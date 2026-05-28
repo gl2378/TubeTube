@@ -92,12 +92,13 @@
       - 首次 downloading 进度回调必须强制 emit,绕过 1/10 降频,避免前端长时间停在 "0%"
 
   - 状态语义(前端表格 status 列)
-      - Pending:已入队,worker 还没取走
-      - Waiting:worker 已取走,正在 FIFO 排队等网络槽位
+      - Waiting:已入队 / worker 接管中 / FIFO 排队等网络槽位(三种情况统一为同一文案)
       - In Progress:已拿到槽位,准备开始下载
       - Downloading:downloading 阶段进度回调中
       - Processing / Processing (<PostProcessor>):后处理阶段(网络槽位已让出)
       - Complete / Cancelled / Failed: <ExceptionName>
+      - 注:历史上曾用 "Pending"(还没被 worker 取走)与 "Waiting"(已被取走在等锁)区分,
+        实际用户没必要感知这个差别,统一为 Waiting/Queued 让 UI 更直观
 
   - 取消机制
       - 每条 item 一把 stop_signals[id] = threading.Event
@@ -140,9 +141,12 @@
       - 未配置时自动检测 deno/node/bun/quickjs(qjs);找到的以 {path: …} 注入 ydl_opts["js_runtimes"]
 
   - THREAD_COUNT 语义说明
-      - 名义上是"worker 线程数",但因网络下载强制串行,**它实质上限制的是"同时进行后处理的并发上限"**
-      - 取值建议:2~4。过小会造成"上一条还没合并完,网络槽位空着没人接"的浪费;
-        过大对一台机器的 CPU/磁盘 IO 收益递减,反而拖慢正在下载的那条的写入
+      - 名义上是"worker 线程数",但因网络下载强制串行,**它实质上限制的是
+        "同时能进入排队/下载/后处理流水线的任务上限"**:
+          - Waiting 中的 worker 只是 cv.wait(timeout=0.5),CPU 几乎为 0
+          - 真正在跑的是 1 条网络下载 + 若干条后处理
+      - 默认 16,日常使用基本不会让任务停在"未被 worker 接管"的状态
+      - 想限制后处理 ffmpeg 并发以保护 CPU/磁盘的话,可调小到 4~8
 
 • Socket.IO 事件契约（前后端约定）
 
